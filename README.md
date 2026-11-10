@@ -1,46 +1,46 @@
-# CTF Forensics Write‑up — Khôi phục thứ đã hiển thị cuối cùng trên màn hình (DWM dump)
+# CTF Forensics Write‑up — Recovering what was last on screen (DWM dump)
 
-**Thử thách**: *Recover what was last on the screen.*  
-Một nhà khoa học đang RDP vào máy Windows. Một cửa sổ lạ lóe lên rồi phiên bị khóa, nhưng EDR đã thu được một file **`dwm.exe.dmp`**. Hỏi: **Lúc đó trên màn hình có gì?**
-
----
-
-## Ý tưởng & Nền tảng kỹ thuật
-
-- **dwm.exe (Desktop Window Manager)** là compositor của Windows: nó giữ **GPU surface** của các cửa sổ rồi ghép (compose) thành khung hình hiển thị.
-- Những surface này **không phải** dạng file ảnh nén (PNG/JPEG) để có thể “carve” trực tiếp. Chúng là **buffer thô** dạng **BGRA 8‑bit** (4 byte/pixel).
-- Mỗi hàng (row) thường có **pitch/stride** **≥ `width*4`** do **padding/alignment** (hay gặp căn theo 256 B). Nếu dựng ảnh mà **không tôn trọng pitch**, ta sẽ thấy sọc/nghiêng/ảnh rách.
-
-**Mục tiêu**: Tìm đúng *offset* nơi surface nằm trong dump, xác định **`width × height`**, **`pitch`**, và **thứ tự kênh** (BGRA) để dựng lại thành PNG.
+**Challenge**: *Recover what was last on the screen.*  
+A scientist is connected over RDP to a Windows machine. A strange window flashes and then the session locks, but the EDR captured a **`dwm.exe.dmp`** file. Question: **What was on the screen at that moment?**
 
 ---
 
-## Quy trình giải (tóm tắt)
+## Idea & technical background
 
-1. **Quét thô (coarse sweep)**: nhảy theo bước lớn trong file dump, thử nhanh một số độ phân giải phổ biến và cả BGRA/RGBA để *“đánh hơi”* xem có mẩu ảnh nào xuất hiện không.
-2. **Ghim neo (anchor)**: chỉ cần **một ảnh rách/torn** là đủ chứng minh có surface + suy ra **độ phân giải** và **vùng offset xấp xỉ**.
-3. **Tái dựng tập trung (focused reconstruction)**: viết script đọc theo **`pitch*height`**, mỗi hàng **chỉ copy `width*4`** byte đầu (bỏ padding), **BGRA→RGBA** (đặt alpha=255), rồi lưu PNG.
-4. **Quét tinh quanh neo**: dịch offset **±512 KiB** với bước **4 KiB**, thử vài **pitch** (ví dụ `W*4 ± 256`) → xuất hàng loạt PNG → **lọc rác** → **lướt xem** đến khi thấy ảnh hoàn chỉnh.
-5. **Kết quả**: ảnh hộp thoại (ransom dialog) hiện rõ → đọc **flag**.
+- **dwm.exe (Desktop Window Manager)** is the Windows compositor: it holds the windows' **GPU surfaces** and composes them into the displayed frame.
+- These surfaces are **not** compressed image files (PNG/JPEG) that can be carved directly. They are **raw buffers** in **8‑bit BGRA** format (4 bytes per pixel).
+- Each row usually has a **pitch/stride** **≥ `width*4`** because of **padding/alignment** (often aligned to 256 B). If the image is rebuilt **without respecting the pitch**, you get stripes, skew or a torn image.
+
+**Goal**: find the exact *offset* of the surface in the dump, determine **`width × height`**, **`pitch`** and the **channel order** (BGRA), then rebuild it as a PNG.
 
 ---
 
-## Bước 1 — Quét thô để tìm “dấu vân tay”
+## Solving process (summary)
 
-Script Python dưới đây quét file theo **bước 16 MiB**, thử các độ phân giải hay gặp và hai thứ tự kênh **BGRA/RGBA**. Công cụ chuyển đổi dùng **ImageMagick** (`convert`).
+1. **Coarse sweep**: jump through the dump in large steps, quickly trying a few common resolutions and both BGRA/RGBA to *"sniff"* for image fragments.
+2. **Anchor**: a single **torn image** is enough to prove a surface exists and to infer the **resolution** and the **approximate offset region**.
+3. **Focused reconstruction**: a script reads **`pitch*height`** bytes, copies **only the first `width*4`** bytes of each row (dropping padding), converts **BGRA→RGBA** (alpha=255) and saves a PNG.
+4. **Fine sweep around the anchor**: shift the offset by **±512 KiB** in **4 KiB** steps, try a few **pitch** values (e.g. `W*4 ± 256`) → export PNGs in bulk → **filter out junk** → **browse** until a complete image appears.
+5. **Result**: the (ransom) dialog becomes clearly visible → read the **flag**.
+
+---
+
+## Step 1 — Coarse sweep to find a "fingerprint"
+
+The Python script below scans the file in **16 MiB steps**, trying common resolutions and both **BGRA/RGBA** channel orders. Conversion uses **ImageMagick** (`convert`).
 
 ```python
 #!/usr/bin/env python3
-# initial_sweep.py — quét thô “cắt lát” raw để tìm dấu vết screenshot
+# initial_sweep.py — coarse "slicing" of raw data to look for screenshot traces
 
 import os, subprocess
 src = "dwm.exe.dmp"
 outdir = "raw_candidates"
 os.makedirs(outdir, exist_ok=True)
 
-# thử vài độ phân giải desktop phổ biến
+# try a few common desktop resolutions
 sizes = [(1366,768),(1024,768),(1920,1080),(1600,900)]
-step = 16 * 1024 * 1024  # nhảy 16 MiB
+step = 16 * 1024 * 1024  # 16 MiB step
 L = os.path.getsize(src)
 idx = 0
 
@@ -74,20 +74,20 @@ for offset in range(0, L, step):
 print("initial sweep done; check raw_candidates/")
 ```
 
-> **Kỳ vọng**: đa số là rác, nhưng chỉ cần **một ảnh rách** (viền hộp thoại, menu bar, v.v.) là đủ **chứng minh có surface** và **gợi ý W×H + vùng offset**.
+> **Expectation**: most outputs are junk, but **one torn image** (dialog border, menu bar, etc.) is enough to **prove a surface exists** and **hint at W×H and the offset region**.
 
 ---
 
-## Bước 2 — Tái dựng có trọng tâm (repack surface)
+## Step 2 — Focused reconstruction (repack the surface)
 
-Từ ảnh rách, suy ra độ phân giải **1024×768**. Với `W=1024`, `W*4 = 4096` B, nhưng do căn dòng theo 256 B, ta sẽ thử **3840, 4096, 4352**.
+From the torn image, the resolution is **1024×768**. With `W=1024`, `W*4 = 4096` B, but because rows are aligned to 256 B we try **3840, 4096, 4352**.
 
-Script dưới đây đọc **`pitch*H`** byte từ `offset`, với **mỗi hàng chỉ lấy `W*4`** byte đầu; chuyển **BGRA→RGBA**, ép **alpha=255** rồi ghi PNG.
+The script below reads **`pitch*H`** bytes from `offset`, **takes only the first `W*4`** bytes of each row, converts **BGRA→RGBA**, forces **alpha=255** and writes a PNG.
 
 ```python
 #!/usr/bin/env python3
-# repack_surface.py — đọc pitch*height tại offset, mỗi hàng copy width*4,
-# BGRA -> RGBA, alpha = 255, lưu PNG.
+# repack_surface.py — read pitch*height at offset, copy width*4 per row,
+# BGRA -> RGBA, alpha = 255, save PNG.
 
 import sys
 from PIL import Image
@@ -127,7 +127,7 @@ if __name__ == "__main__":
         print("usage: repack_surface.py dump offset width height pitch out.png")
         sys.exit(1)
     src = sys.argv[1]
-    offset = int(sys.argv[2])      # nhập số thập phân, không phải 0x...
+    offset = int(sys.argv[2])      # decimal number, not 0x...
     W = int(sys.argv[3])
     H = int(sys.argv[4])
     pitch = int(sys.argv[5])
@@ -136,23 +136,23 @@ if __name__ == "__main__":
     print("OK" if ok else "FAIL")
 ```
 
-**Cài đặt phụ thuộc**:
+**Install dependencies**:
 ```bash
 python3 -m pip install pillow
-# và ImageMagick nếu dùng script quét thô:
+# and ImageMagick if you use the coarse sweep script:
 # sudo apt install imagemagick
 ```
 
 ---
 
-## Bước 3 — Quét tinh quanh offset mốc
+## Step 3 — Fine sweep around the anchor offset
 
-Dịch offset **±512 KiB**, bước **4 KiB**, thử 3 giá trị `pitch` ở trên; dựng ảnh hàng loạt, xóa ảnh quá nhỏ (< 20 KB) để giảm rác; sau đó liệt kê **20 ảnh lớn nhất** (thường là ảnh “đúng”) để mở xem.
+Shift the offset by **±512 KiB** in **4 KiB** steps and try the 3 `pitch` values above; rebuild images in bulk, delete images that are too small (< 20 KB) to cut down junk, then list the **20 largest images** (usually the "right" ones) to inspect.
 
 ```bash
-BASE=16777216         # offset neo từ quét thô
+BASE=16777216         # anchor offset from the coarse sweep
 SPAN=524288           # ±512 KiB
-STEP=4096             # bước 4 KiB
+STEP=4096             # 4 KiB step
 W=1024; H=768
 PITCHES=(3840 4096 4352)
 
@@ -161,51 +161,51 @@ for off in $(seq $((BASE - SPAN)) $STEP $((BASE + SPAN))); do
   for p in "${PITCHES[@]}"; do
     out=png_1024x768_scan/cand_off${off}_p${p}.png
     python3 repack_surface.py dwm.exe.dmp $off $W $H $p $out >/dev/null 2>&1 || true
-    # lọc PNG rác quá nhỏ
+    # drop junk PNGs that are too small
     [ -f "$out" ] && [ $(stat -c%s "$out") -lt 20000 ] && rm -f "$out"
   done
 done
 
-# gợi ý 20 file lớn nhất để bạn xem trước
+# show the 20 largest files to review first
 ls -S png_1024x768_scan/*.png | head -20
 ```
 
-> **Mẹo**: nếu màu bị lệch (tông xanh/đỏ đảo), có thể do thứ tự kênh. DWM thường là **BGRA**, nên đoạn repack đã đổi về RGBA sẵn.
+> **Tip**: if the colours look off (blue/red swapped), the channel order may be wrong. DWM is usually **BGRA**, so the repack step already converts to RGBA.
 
 ---
 
-## Kết quả
+## Result
 
-Khi lướt qua các ảnh đã dựng, phần sọc/tearing biến mất dần khi `pitch` & `offset` đúng. Ảnh hộp thoại tống tiền hiện rõ trong file ví dụ:
+Browsing the rebuilt images, the stripes/tearing disappear as `pitch` and `offset` become correct. The ransom dialog is clearly visible in this example file:
 
 ```
 png_1024x768_scan/cand_off17158144_p4096.png
 ```
 
-**Flag thu được**:  
+**Flag**:  
 ```
 sun{r3m0t3_pwn4g3_QQ}
 ```
 
 ---
 
-## Pitfall & Ghi chú thực chiến
+## Pitfalls & practical notes
 
-- **Sai pitch** → ảnh sọc/nghiêng/rách. Hãy ưu tiên dò pitch trước khi phán sai kênh.
-- **Sai thứ tự kênh** → màu kỳ lạ. DWM thường **BGRA**.
-- **Sai W×H** → ảnh méo, không nhận ra UI. Hãy thử vài độ phân giải desktop phổ biến.
-- **Offset không thẳng** (trường hợp hiếm) → cần phương pháp khác (plugin Volatility, trích handle surface, v.v.). Bài này là buffer thô liên tiếp nên cách trên là tối ưu.
+- **Wrong pitch** → striped, skewed or torn image. Pin down the pitch before blaming the channel order.
+- **Wrong channel order** → strange colours. DWM is usually **BGRA**.
+- **Wrong W×H** → distorted image with unrecognisable UI. Try several common desktop resolutions.
+- **Non-contiguous offset** (rare) → needs another approach (Volatility plugins, extracting surface handles, etc.). In this challenge the buffer is raw and contiguous, so the method above is the best fit.
 
 ---
 
-## Tóm lược một lệnh‑chạy‑là‑ra (One‑shot)
+## One-shot summary
 
 ```bash
-# 1) Quét thô để "ngửi" offset & W×H (tùy chọn, có ImageMagick)
+# 1) Coarse sweep to "sniff" the offset & W×H (optional, needs ImageMagick)
 python3 initial_sweep.py
 
-# 2) Khi đã nghi 1024x768 và có offset neo (vd BASE=16777216),
-# quét tinh quanh neo và dựng hàng loạt PNG:
+# 2) Once 1024x768 is suspected and an anchor offset is known (e.g. BASE=16777216),
+# fine-sweep around the anchor and rebuild PNGs in bulk:
 BASE=16777216; SPAN=524288; STEP=4096; W=1024; H=768
 PITCHES=(3840 4096 4352)
 mkdir -p png_1024x768_scan
@@ -219,8 +219,8 @@ ls -S png_1024x768_scan/*.png | head -20
 
 ---
 
-### Kết luận
+### Conclusion
 
-- Với dump **DWM**, “*last on screen*” khả dĩ là **screenshot** đang nằm trong **surface BGRA** có **pitch**.  
-- Quy trình nhanh: **quét thô → ghim neo → repack có pitch → quét tinh → soi kết quả**.  
-- Áp dụng vào bài này, ta khôi phục được **ransom dialog** và đọc **flag**: `sun{r3m0t3_pwn4g3_QQ}`.
+- With a **DWM** dump, "*last on screen*" is most likely a **screenshot** sitting in a **BGRA surface** with a **pitch**.  
+- Fast workflow: **coarse sweep → anchor → pitch-aware repack → fine sweep → inspect results**.  
+- Applied to this challenge, we recover the **ransom dialog** and read the **flag**: `sun{r3m0t3_pwn4g3_QQ}`.
